@@ -544,8 +544,15 @@ func (p *testGetterStorage) New() runtime.Object {
 	}
 }
 
+func (p *testGetterStorage) Destroy() {
+}
+
 func (p *testGetterStorage) Get(ctx context.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
 	return nil, nil
+}
+
+func (p *testGetterStorage) GetSingularName() string {
+	return "getter"
 }
 
 type testNoVerbsStorage struct {
@@ -563,6 +570,13 @@ func (p *testNoVerbsStorage) New() runtime.Object {
 			APIVersion: p.Version,
 		},
 	}
+}
+
+func (p *testNoVerbsStorage) Destroy() {
+}
+
+func (p *testNoVerbsStorage) GetSingularName() string {
+	return "noverb"
 }
 
 func fakeVersion() version.Info {

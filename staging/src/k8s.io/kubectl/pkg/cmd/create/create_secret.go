@@ -19,7 +19,6 @@ package create
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path"
 	"strings"
@@ -31,7 +30,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
-	"k8s.io/cli-runtime/pkg/resource"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
 	"k8s.io/kubectl/pkg/scheme"
@@ -112,9 +110,9 @@ type CreateSecretOptions struct {
 	Namespace        string
 	EnforceNamespace bool
 
-	Client         corev1client.CoreV1Interface
-	DryRunStrategy cmdutil.DryRunStrategy
-	DryRunVerifier *resource.DryRunVerifier
+	Client              corev1client.CoreV1Interface
+	DryRunStrategy      cmdutil.DryRunStrategy
+	ValidationDirective string
 
 	genericclioptions.IOStreams
 }
@@ -151,7 +149,7 @@ func NewCmdCreateSecretGeneric(f cmdutil.Factory, ioStreams genericclioptions.IO
 
 	cmd.Flags().StringSliceVar(&o.FileSources, "from-file", o.FileSources, "Key files can be specified using their file path, in which case a default name will be given to them, or optionally with a name and file path, in which case the given name will be used.  Specifying a directory will iterate each named file in the directory that is a valid secret key.")
 	cmd.Flags().StringArrayVar(&o.LiteralSources, "from-literal", o.LiteralSources, "Specify a key and literal value to insert in secret (i.e. mykey=somevalue)")
-	cmd.Flags().StringSliceVar(&o.EnvFileSources, "from-env-file", o.EnvFileSources, "Specify the path to a file to read lines of key=val pairs to create a secret (i.e. a Docker .env file).")
+	cmd.Flags().StringSliceVar(&o.EnvFileSources, "from-env-file", o.EnvFileSources, "Specify the path to a file to read lines of key=val pairs to create a secret.")
 	cmd.Flags().StringVar(&o.Type, "type", o.Type, i18n.T("The type of secret to create"))
 	cmd.Flags().BoolVar(&o.AppendHash, "append-hash", o.AppendHash, "Append a hash of the secret to its name.")
 
@@ -185,31 +183,24 @@ func (o *CreateSecretOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, ar
 		return err
 	}
 
-	dynamicClient, err := f.DynamicClient()
-	if err != nil {
-		return err
-	}
-
-	discoveryClient, err := f.ToDiscoveryClient()
-	if err != nil {
-		return err
-	}
-
-	o.DryRunVerifier = resource.NewDryRunVerifier(dynamicClient, discoveryClient)
-
 	o.Namespace, o.EnforceNamespace, err = f.ToRawKubeConfigLoader().Namespace()
 	if err != nil {
-		return nil
+		return err
 	}
 
 	cmdutil.PrintFlagsWithDryRunStrategy(o.PrintFlags, o.DryRunStrategy)
 	printer, err := o.PrintFlags.ToPrinter()
 	if err != nil {
-		return nil
+		return err
 	}
 
 	o.PrintObj = func(obj runtime.Object) error {
 		return printer.PrintObj(obj, o.Out)
+	}
+
+	o.ValidationDirective, err = cmdutil.GetValidationDirective(cmd)
+	if err != nil {
+		return err
 	}
 
 	return nil
@@ -242,11 +233,8 @@ func (o *CreateSecretOptions) Run() error {
 		if o.FieldManager != "" {
 			createOptions.FieldManager = o.FieldManager
 		}
+		createOptions.FieldValidation = o.ValidationDirective
 		if o.DryRunStrategy == cmdutil.DryRunServer {
-			err := o.DryRunVerifier.HasSupport(secret.GroupVersionKind())
-			if err != nil {
-				return err
-			}
 			createOptions.DryRun = []string{metav1.DryRunAll}
 		}
 		secret, err = o.Client.Secrets(o.Namespace).Create(context.TODO(), secret, createOptions)
@@ -345,13 +333,13 @@ func handleSecretFromFileSources(secret *corev1.Secret, fileSources []string) er
 			if strings.Contains(fileSource, "=") {
 				return fmt.Errorf("cannot give a key name for a directory path")
 			}
-			fileList, err := ioutil.ReadDir(filePath)
+			fileList, err := os.ReadDir(filePath)
 			if err != nil {
 				return fmt.Errorf("error listing files in %s: %v", filePath, err)
 			}
 			for _, item := range fileList {
 				itemPath := path.Join(filePath, item.Name())
-				if item.Mode().IsRegular() {
+				if item.Type().IsRegular() {
 					keyName = item.Name()
 					if err := addKeyFromFileToSecret(secret, keyName, itemPath); err != nil {
 						return err
@@ -400,7 +388,7 @@ func handleSecretFromEnvFileSources(secret *corev1.Secret, envFileSources []stri
 // addKeyFromFileToSecret adds a key with the given name to a Secret, populating
 // the value with the content of the given file path, or returns an error.
 func addKeyFromFileToSecret(secret *corev1.Secret, keyName, filePath string) error {
-	data, err := ioutil.ReadFile(filePath)
+	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return err
 	}

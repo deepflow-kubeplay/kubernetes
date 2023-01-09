@@ -27,7 +27,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
-	"k8s.io/cli-runtime/pkg/resource"
 	rbacclientv1 "k8s.io/client-go/kubernetes/typed/rbac/v1"
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
 	"k8s.io/kubectl/pkg/scheme"
@@ -61,9 +60,9 @@ type RoleBindingOptions struct {
 	FieldManager     string
 	CreateAnnotation bool
 
-	Client         rbacclientv1.RbacV1Interface
-	DryRunStrategy cmdutil.DryRunStrategy
-	DryRunVerifier *resource.DryRunVerifier
+	Client              rbacclientv1.RbacV1Interface
+	DryRunStrategy      cmdutil.DryRunStrategy
+	ValidationDirective string
 
 	genericclioptions.IOStreams
 }
@@ -103,9 +102,9 @@ func NewCmdCreateRoleBinding(f cmdutil.Factory, ioStreams genericclioptions.IOSt
 	cmdutil.AddDryRunFlag(cmd)
 	cmd.Flags().StringVar(&o.ClusterRole, "clusterrole", "", i18n.T("ClusterRole this RoleBinding should reference"))
 	cmd.Flags().StringVar(&o.Role, "role", "", i18n.T("Role this RoleBinding should reference"))
-	cmd.Flags().StringArrayVar(&o.Users, "user", o.Users, "Usernames to bind to the role")
-	cmd.Flags().StringArrayVar(&o.Groups, "group", o.Groups, "Groups to bind to the role")
-	cmd.Flags().StringArrayVar(&o.ServiceAccounts, "serviceaccount", o.ServiceAccounts, "Service accounts to bind to the role, in the format <namespace>:<name>")
+	cmd.Flags().StringArrayVar(&o.Users, "user", o.Users, "Usernames to bind to the role. The flag can be repeated to add multiple users.")
+	cmd.Flags().StringArrayVar(&o.Groups, "group", o.Groups, "Groups to bind to the role. The flag can be repeated to add multiple groups.")
+	cmd.Flags().StringArrayVar(&o.ServiceAccounts, "serviceaccount", o.ServiceAccounts, "Service accounts to bind to the role, in the format <namespace>:<name>. The flag can be repeated to add multiple service accounts.")
 	cmdutil.AddFieldManagerFlagVar(cmd, &o.FieldManager, "kubectl-create")
 	return cmd
 }
@@ -136,11 +135,6 @@ func (o *RoleBindingOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, arg
 	if err != nil {
 		return err
 	}
-	dynamicCient, err := f.DynamicClient()
-	if err != nil {
-		return err
-	}
-	o.DryRunVerifier = resource.NewDryRunVerifier(dynamicCient, f.OpenAPIGetter())
 	cmdutil.PrintFlagsWithDryRunStrategy(o.PrintFlags, o.DryRunStrategy)
 	printer, err := o.PrintFlags.ToPrinter()
 	if err != nil {
@@ -149,7 +143,9 @@ func (o *RoleBindingOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, arg
 	o.PrintObj = func(obj runtime.Object) error {
 		return printer.PrintObj(obj, o.Out)
 	}
-	return nil
+
+	o.ValidationDirective, err = cmdutil.GetValidationDirective(cmd)
+	return err
 }
 
 // Validate validates required fields are set
@@ -178,10 +174,8 @@ func (o *RoleBindingOptions) Run() error {
 		if o.FieldManager != "" {
 			createOptions.FieldManager = o.FieldManager
 		}
+		createOptions.FieldValidation = o.ValidationDirective
 		if o.DryRunStrategy == cmdutil.DryRunServer {
-			if err := o.DryRunVerifier.HasSupport(roleBinding.GroupVersionKind()); err != nil {
-				return err
-			}
 			createOptions.DryRun = []string{metav1.DryRunAll}
 		}
 		roleBinding, err = o.Client.RoleBindings(o.Namespace).Create(context.TODO(), roleBinding, createOptions)

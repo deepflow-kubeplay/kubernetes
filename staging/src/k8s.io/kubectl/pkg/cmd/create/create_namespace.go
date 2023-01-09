@@ -19,12 +19,12 @@ package create
 import (
 	"context"
 	"fmt"
+
 	"github.com/spf13/cobra"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/cli-runtime/pkg/resource"
 	coreclient "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/kubectl/pkg/scheme"
 	"k8s.io/kubectl/pkg/util"
@@ -51,10 +51,10 @@ type NamespaceOptions struct {
 	// Name of resource being created
 	Name string
 
-	DryRunStrategy   cmdutil.DryRunStrategy
-	DryRunVerifier   *resource.DryRunVerifier
-	CreateAnnotation bool
-	FieldManager     string
+	DryRunStrategy      cmdutil.DryRunStrategy
+	ValidationDirective string
+	CreateAnnotation    bool
+	FieldManager        string
 
 	Client *coreclient.CoreV1Client
 
@@ -121,15 +121,6 @@ func (o *NamespaceOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, args 
 	if err != nil {
 		return err
 	}
-	dynamicClient, err := f.DynamicClient()
-	if err != nil {
-		return err
-	}
-	discoveryClient, err := f.ToDiscoveryClient()
-	if err != nil {
-		return err
-	}
-	o.DryRunVerifier = resource.NewDryRunVerifier(dynamicClient, discoveryClient)
 	o.CreateAnnotation = cmdutil.GetFlagBool(cmd, cmdutil.ApplyAnnotationsFlag)
 	cmdutil.PrintFlagsWithDryRunStrategy(o.PrintFlags, o.DryRunStrategy)
 	printer, err := o.PrintFlags.ToPrinter()
@@ -139,7 +130,9 @@ func (o *NamespaceOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, args 
 	o.PrintObj = func(obj runtime.Object) error {
 		return printer.PrintObj(obj, o.Out)
 	}
-	return nil
+
+	o.ValidationDirective, err = cmdutil.GetValidationDirective(cmd)
+	return err
 }
 
 // Run calls the CreateSubcommandOptions.Run in NamespaceOpts instance
@@ -154,10 +147,8 @@ func (o *NamespaceOptions) Run() error {
 		if o.FieldManager != "" {
 			createOptions.FieldManager = o.FieldManager
 		}
+		createOptions.FieldValidation = o.ValidationDirective
 		if o.DryRunStrategy == cmdutil.DryRunServer {
-			if err := o.DryRunVerifier.HasSupport(namespace.GroupVersionKind()); err != nil {
-				return err
-			}
 			createOptions.DryRun = []string{metav1.DryRunAll}
 		}
 		var err error

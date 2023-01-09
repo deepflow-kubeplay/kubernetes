@@ -25,6 +25,7 @@ import (
 	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/install"
 	v1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
+	"k8s.io/apiextensions-apiserver/pkg/apiserver/conversion"
 	"k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	externalinformers "k8s.io/apiextensions-apiserver/pkg/client/informers/externalversions"
 	"k8s.io/apiextensions-apiserver/pkg/controller/apiapproval"
@@ -48,7 +49,6 @@ import (
 	genericapiserver "k8s.io/apiserver/pkg/server"
 	serverstorage "k8s.io/apiserver/pkg/server/storage"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	"k8s.io/apiserver/pkg/util/webhook"
 )
 
 var (
@@ -83,10 +83,8 @@ type ExtraConfig struct {
 	// the CRD Establishing will be hold by 5 seconds.
 	MasterCount int
 
-	// ServiceResolver is used in CR webhook converters to resolve webhook's service names
-	ServiceResolver webhook.ServiceResolver
-	// AuthResolverWrapper is used in CR webhook converters
-	AuthResolverWrapper webhook.AuthenticationInfoResolverWrapper
+	// ConversionFactory is used to provider converters for CRs.
+	ConversionFactory conversion.Factory
 }
 
 type Config struct {
@@ -149,16 +147,17 @@ func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget)
 
 	apiResourceConfig := c.GenericConfig.MergedResourceConfig
 	apiGroupInfo := genericapiserver.NewDefaultAPIGroupInfo(apiextensions.GroupName, Scheme, metav1.ParameterCodec, Codecs)
-	if apiResourceConfig.VersionEnabled(v1.SchemeGroupVersion) {
-		storage := map[string]rest.Storage{}
-		// customresourcedefinitions
+	storage := map[string]rest.Storage{}
+	// customresourcedefinitions
+	if resource := "customresourcedefinitions"; apiResourceConfig.ResourceEnabled(v1.SchemeGroupVersion.WithResource(resource)) {
 		customResourceDefinitionStorage, err := customresourcedefinition.NewREST(Scheme, c.GenericConfig.RESTOptionsGetter)
 		if err != nil {
 			return nil, err
 		}
-		storage["customresourcedefinitions"] = customResourceDefinitionStorage
-		storage["customresourcedefinitions/status"] = customresourcedefinition.NewStatusREST(Scheme, customResourceDefinitionStorage)
-
+		storage[resource] = customResourceDefinitionStorage
+		storage[resource+"/status"] = customresourcedefinition.NewStatusREST(Scheme, customResourceDefinitionStorage)
+	}
+	if len(storage) > 0 {
 		apiGroupInfo.VersionedResourcesStorageMap[v1.SchemeGroupVersion.Version] = storage
 	}
 
@@ -196,8 +195,7 @@ func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget)
 		c.ExtraConfig.CRDRESTOptionsGetter,
 		c.GenericConfig.AdmissionControl,
 		establishingController,
-		c.ExtraConfig.ServiceResolver,
-		c.ExtraConfig.AuthResolverWrapper,
+		c.ExtraConfig.ConversionFactory,
 		c.ExtraConfig.MasterCount,
 		s.GenericAPIServer.Authorizer,
 		c.GenericConfig.RequestTimeout,
@@ -210,8 +208,9 @@ func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget)
 	}
 	s.GenericAPIServer.Handler.NonGoRestfulMux.Handle("/apis", crdHandler)
 	s.GenericAPIServer.Handler.NonGoRestfulMux.HandlePrefix("/apis/", crdHandler)
+	s.GenericAPIServer.RegisterDestroyFunc(crdHandler.destroy)
 
-	discoveryController := NewDiscoveryController(s.Informers.Apiextensions().V1().CustomResourceDefinitions(), versionDiscoveryHandler, groupDiscoveryHandler)
+	discoveryController := NewDiscoveryController(s.Informers.Apiextensions().V1().CustomResourceDefinitions(), versionDiscoveryHandler, groupDiscoveryHandler, genericServer.AggregatedDiscoveryGroupManager)
 	namingController := status.NewNamingConditionController(s.Informers.Apiextensions().V1().CustomResourceDefinitions(), crdClient.ApiextensionsV1())
 	nonStructuralSchemaController := nonstructuralschema.NewConditionController(s.Informers.Apiextensions().V1().CustomResourceDefinitions(), crdClient.ApiextensionsV1())
 	apiApprovalController := apiapproval.NewKubernetesAPIApprovalPolicyConformantConditionController(s.Informers.Apiextensions().V1().CustomResourceDefinitions(), crdClient.ApiextensionsV1())
@@ -220,11 +219,6 @@ func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget)
 		crdClient.ApiextensionsV1(),
 		crdHandler,
 	)
-	openapiController := openapicontroller.NewController(s.Informers.Apiextensions().V1().CustomResourceDefinitions())
-	var openapiv3Controller *openapiv3controller.Controller
-	if utilfeature.DefaultFeatureGate.Enabled(features.OpenAPIV3) {
-		openapiv3Controller = openapiv3controller.NewController(s.Informers.Apiextensions().V1().CustomResourceDefinitions())
-	}
 
 	s.GenericAPIServer.AddPostStartHookOrDie("start-apiextensions-informers", func(context genericapiserver.PostStartHookContext) error {
 		s.Informers.Start(context.StopCh)
@@ -235,9 +229,14 @@ func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget)
 		// Together they serve the /openapi/v2 endpoint on a generic apiserver. A generic apiserver may
 		// choose to not enable OpenAPI by having null openAPIConfig, and thus OpenAPIVersionedService
 		// and StaticOpenAPISpec are both null. In that case we don't run the CRD OpenAPI controller.
-		if s.GenericAPIServer.OpenAPIVersionedService != nil && s.GenericAPIServer.StaticOpenAPISpec != nil {
-			go openapiController.Run(s.GenericAPIServer.StaticOpenAPISpec, s.GenericAPIServer.OpenAPIVersionedService, context.StopCh)
-			if utilfeature.DefaultFeatureGate.Enabled(features.OpenAPIV3) {
+		if s.GenericAPIServer.StaticOpenAPISpec != nil {
+			if s.GenericAPIServer.OpenAPIVersionedService != nil {
+				openapiController := openapicontroller.NewController(s.Informers.Apiextensions().V1().CustomResourceDefinitions())
+				go openapiController.Run(s.GenericAPIServer.StaticOpenAPISpec, s.GenericAPIServer.OpenAPIVersionedService, context.StopCh)
+			}
+
+			if s.GenericAPIServer.OpenAPIV3VersionedService != nil && utilfeature.DefaultFeatureGate.Enabled(features.OpenAPIV3) {
+				openapiv3Controller := openapiv3controller.NewController(s.Informers.Apiextensions().V1().CustomResourceDefinitions())
 				go openapiv3Controller.Run(s.GenericAPIServer.OpenAPIV3VersionedService, context.StopCh)
 			}
 		}

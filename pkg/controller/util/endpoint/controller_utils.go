@@ -22,11 +22,10 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
-	"sync"
 
 	v1 "k8s.io/api/core/v1"
 	discovery "k8s.io/api/discovery/v1"
-	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/apimachinery/pkg/conversion"
 	"k8s.io/apimachinery/pkg/labels"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -37,54 +36,27 @@ import (
 	"k8s.io/kubernetes/pkg/util/hash"
 )
 
-// ServiceSelectorCache is a cache of service selectors to avoid high CPU consumption caused by frequent calls to AsSelectorPreValidated (see #73527)
-type ServiceSelectorCache struct {
-	lock  sync.RWMutex
-	cache map[string]labels.Selector
-}
-
-// NewServiceSelectorCache init ServiceSelectorCache for both endpoint controller and endpointSlice controller.
-func NewServiceSelectorCache() *ServiceSelectorCache {
-	return &ServiceSelectorCache{
-		cache: map[string]labels.Selector{},
-	}
-}
-
-// Get return selector and existence in ServiceSelectorCache by key.
-func (sc *ServiceSelectorCache) Get(key string) (labels.Selector, bool) {
-	sc.lock.RLock()
-	selector, ok := sc.cache[key]
-	// fine-grained lock improves GetPodServiceMemberships performance(16.5%) than defer measured by BenchmarkGetPodServiceMemberships
-	sc.lock.RUnlock()
-	return selector, ok
-}
-
-// Update can update or add a selector in ServiceSelectorCache while service's selector changed.
-func (sc *ServiceSelectorCache) Update(key string, rawSelector map[string]string) labels.Selector {
-	sc.lock.Lock()
-	defer sc.lock.Unlock()
-	selector := labels.Set(rawSelector).AsSelectorPreValidated()
-	sc.cache[key] = selector
-	return selector
-}
-
-// Delete can delete selector which exist in ServiceSelectorCache.
-func (sc *ServiceSelectorCache) Delete(key string) {
-	sc.lock.Lock()
-	defer sc.lock.Unlock()
-	delete(sc.cache, key)
-}
+// semanticIgnoreResourceVersion does semantic deep equality checks for objects
+// but excludes ResourceVersion of ObjectReference. They are used when comparing
+// endpoints in Endpoints and EndpointSlice objects to avoid unnecessary updates
+// caused by Pod resourceVersion change.
+var semanticIgnoreResourceVersion = conversion.EqualitiesOrDie(
+	func(a, b v1.ObjectReference) bool {
+		a.ResourceVersion = ""
+		b.ResourceVersion = ""
+		return a == b
+	},
+)
 
 // GetPodServiceMemberships returns a set of Service keys for Services that have
 // a selector matching the given pod.
-func (sc *ServiceSelectorCache) GetPodServiceMemberships(serviceLister v1listers.ServiceLister, pod *v1.Pod) (sets.String, error) {
+func GetPodServiceMemberships(serviceLister v1listers.ServiceLister, pod *v1.Pod) (sets.String, error) {
 	set := sets.String{}
 	services, err := serviceLister.Services(pod.Namespace).List(labels.Everything())
 	if err != nil {
 		return set, err
 	}
 
-	var selector labels.Selector
 	for _, service := range services {
 		if service.Spec.Selector == nil {
 			// if the service has a nil selector this means selectors match nothing, not everything.
@@ -94,13 +66,7 @@ func (sc *ServiceSelectorCache) GetPodServiceMemberships(serviceLister v1listers
 		if err != nil {
 			return nil, err
 		}
-		if v, ok := sc.Get(key); ok {
-			selector = v
-		} else {
-			selector = sc.Update(key, service.Spec.Selector)
-		}
-
-		if selector.Matches(labels.Set(pod.Labels)) {
+		if labels.ValidatedSetSelector(service.Spec.Selector).Matches(labels.Set(pod.Labels)) {
 			set.Insert(key)
 		}
 	}
@@ -123,23 +89,23 @@ func DeepHashObjectToString(objectToWrite interface{}) string {
 	return hex.EncodeToString(hasher.Sum(nil)[0:])
 }
 
-// ShouldPodBeInEndpointSlice returns true if a specified pod should be in an EndpointSlice object.
-// Terminating pods are only included if includeTerminating is true
-func ShouldPodBeInEndpointSlice(pod *v1.Pod, includeTerminating bool) bool {
+// ShouldPodBeInEndpoints returns true if a specified pod should be in an
+// Endpoints or EndpointSlice resource. Terminating pods are only included if
+// includeTerminating is true.
+func ShouldPodBeInEndpoints(pod *v1.Pod, includeTerminating bool) bool {
+	// "Terminal" describes when a Pod is complete (in a succeeded or failed phase).
+	// This is distinct from the "Terminating" condition which represents when a Pod
+	// is being terminated (metadata.deletionTimestamp is non nil).
+	if podutil.IsPodTerminal(pod) {
+		return false
+	}
+
 	if len(pod.Status.PodIP) == 0 && len(pod.Status.PodIPs) == 0 {
 		return false
 	}
 
 	if !includeTerminating && pod.DeletionTimestamp != nil {
 		return false
-	}
-
-	if pod.Spec.RestartPolicy == v1.RestartPolicyNever {
-		return pod.Status.Phase != v1.PodFailed && pod.Status.Phase != v1.PodSucceeded
-	}
-
-	if pod.Spec.RestartPolicy == v1.RestartPolicyOnFailure {
-		return pod.Status.Phase != v1.PodSucceeded
 	}
 
 	return true
@@ -194,7 +160,7 @@ func podEndpointsChanged(oldPod, newPod *v1.Pod) (bool, bool) {
 
 // GetServicesToUpdateOnPodChange returns a set of Service keys for Services
 // that have potentially been affected by a change to this pod.
-func GetServicesToUpdateOnPodChange(serviceLister v1listers.ServiceLister, selectorCache *ServiceSelectorCache, old, cur interface{}) sets.String {
+func GetServicesToUpdateOnPodChange(serviceLister v1listers.ServiceLister, old, cur interface{}) sets.String {
 	newPod := cur.(*v1.Pod)
 	oldPod := old.(*v1.Pod)
 	if newPod.ResourceVersion == oldPod.ResourceVersion {
@@ -210,14 +176,14 @@ func GetServicesToUpdateOnPodChange(serviceLister v1listers.ServiceLister, selec
 		return sets.String{}
 	}
 
-	services, err := selectorCache.GetPodServiceMemberships(serviceLister, newPod)
+	services, err := GetPodServiceMemberships(serviceLister, newPod)
 	if err != nil {
 		utilruntime.HandleError(fmt.Errorf("unable to get pod %s/%s's service memberships: %v", newPod.Namespace, newPod.Name, err))
 		return sets.String{}
 	}
 
 	if labelsChanged {
-		oldServices, err := selectorCache.GetPodServiceMemberships(serviceLister, oldPod)
+		oldServices, err := GetPodServiceMemberships(serviceLister, oldPod)
 		if err != nil {
 			utilruntime.HandleError(fmt.Errorf("unable to get pod %s/%s's service memberships: %v", newPod.Namespace, newPod.Name, err))
 		}
@@ -279,13 +245,14 @@ func (sl portsInOrder) Less(i, j int) bool {
 
 // EndpointsEqualBeyondHash returns true if endpoints have equal attributes
 // but excludes equality checks that would have already been covered with
-// endpoint hashing (see hashEndpoint func for more info).
+// endpoint hashing (see hashEndpoint func for more info) and ignores difference
+// in ResourceVersion of TargetRef.
 func EndpointsEqualBeyondHash(ep1, ep2 *discovery.Endpoint) bool {
-	if stringPtrChanged(ep1.NodeName, ep1.NodeName) {
+	if stringPtrChanged(ep1.NodeName, ep2.NodeName) {
 		return false
 	}
 
-	if stringPtrChanged(ep1.Zone, ep1.Zone) {
+	if stringPtrChanged(ep1.Zone, ep2.Zone) {
 		return false
 	}
 
@@ -293,7 +260,15 @@ func EndpointsEqualBeyondHash(ep1, ep2 *discovery.Endpoint) bool {
 		return false
 	}
 
-	if objectRefPtrChanged(ep1.TargetRef, ep2.TargetRef) {
+	if boolPtrChanged(ep1.Conditions.Serving, ep2.Conditions.Serving) {
+		return false
+	}
+
+	if boolPtrChanged(ep1.Conditions.Terminating, ep2.Conditions.Terminating) {
+		return false
+	}
+
+	if !semanticIgnoreResourceVersion.DeepEqual(ep1.TargetRef, ep2.TargetRef) {
 		return false
 	}
 
@@ -311,18 +286,6 @@ func boolPtrChanged(ptr1, ptr2 *bool) bool {
 	return false
 }
 
-// objectRefPtrChanged returns true if a set of object ref pointers have
-// different values.
-func objectRefPtrChanged(ref1, ref2 *v1.ObjectReference) bool {
-	if (ref1 == nil) != (ref2 == nil) {
-		return true
-	}
-	if ref1 != nil && ref2 != nil && !apiequality.Semantic.DeepEqual(*ref1, *ref2) {
-		return true
-	}
-	return false
-}
-
 // stringPtrChanged returns true if a set of string pointers have different values.
 func stringPtrChanged(ptr1, ptr2 *string) bool {
 	if (ptr1 == nil) != (ptr2 == nil) {
@@ -332,4 +295,10 @@ func stringPtrChanged(ptr1, ptr2 *string) bool {
 		return true
 	}
 	return false
+}
+
+// EndpointSubsetsEqualIgnoreResourceVersion returns true if EndpointSubsets
+// have equal attributes but excludes ResourceVersion of Pod.
+func EndpointSubsetsEqualIgnoreResourceVersion(subsets1, subsets2 []v1.EndpointSubset) bool {
+	return semanticIgnoreResourceVersion.DeepEqual(subsets1, subsets2)
 }

@@ -124,15 +124,16 @@ func (o *ConvertOptions) Complete(f cmdutil.Factory, cmd *cobra.Command) (err er
 	}
 
 	o.validator = func() (validation.Schema, error) {
-		return f.Validator(cmdutil.GetFlagBool(cmd, "validate"))
+		directive, err := cmdutil.GetValidationDirective(cmd)
+		if err != nil {
+			return nil, err
+		}
+		return f.Validator(directive)
 	}
 
 	// build the printer
 	o.Printer, err = o.PrintFlags.ToPrinter()
-	if err != nil {
-		return err
-	}
-	return nil
+	return err
 }
 
 // RunConvert implements the generic Convert command

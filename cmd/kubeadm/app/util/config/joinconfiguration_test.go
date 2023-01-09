@@ -17,20 +17,16 @@ limitations under the License.
 package config
 
 import (
-	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/lithammer/dedent"
-
-	kubeadmapiv1old "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta2"
 )
 
 func TestLoadJoinConfigurationFromFile(t *testing.T) {
 	// Create temp folder for the test case
-	tmpdir, err := ioutil.TempDir("", "")
+	tmpdir, err := os.MkdirTemp("", "")
 	if err != nil {
 		t.Fatalf("Couldn't create tmpdir: %v", err)
 	}
@@ -45,29 +41,6 @@ func TestLoadJoinConfigurationFromFile(t *testing.T) {
 		{
 			name:      "empty file causes error",
 			expectErr: true,
-		},
-		{
-			name: "Invalid v1beta2 causes error",
-			fileContents: dedent.Dedent(fmt.Sprintf(`
-				apiVersion: %s
-				kind: JoinConfiguration
-			`, kubeadmapiv1old.SchemeGroupVersion.String())),
-			expectErr: true,
-		},
-		{
-			name: "valid v1beta2 is loaded",
-			fileContents: dedent.Dedent(fmt.Sprintf(`
-				apiVersion: %s
-				kind: JoinConfiguration
-				caCertPath: /etc/kubernetes/pki/ca.crt
-				discovery:
-				  bootstrapToken:
-				    apiServerEndpoint: kube-apiserver:6443
-				    token: abcdef.0123456789abcdef
-				    unsafeSkipCAVerification: true
-				  timeout: 5m0s
-				  tlsBootstrapToken: abcdef.0123456789abcdef
-			`, kubeadmapiv1old.SchemeGroupVersion.String())),
 		},
 		{
 			name: "Invalid v1beta3 causes error",
@@ -97,7 +70,7 @@ func TestLoadJoinConfigurationFromFile(t *testing.T) {
 	for _, rt := range tests {
 		t.Run(rt.name, func(t2 *testing.T) {
 			cfgPath := filepath.Join(tmpdir, rt.name)
-			err := ioutil.WriteFile(cfgPath, []byte(rt.fileContents), 0644)
+			err := os.WriteFile(cfgPath, []byte(rt.fileContents), 0644)
 			if err != nil {
 				t.Errorf("Couldn't create file: %v", err)
 				return

@@ -38,9 +38,6 @@ import (
 )
 
 const (
-	// DefaultBindTimeoutSeconds defines the default bind timeout in seconds
-	DefaultBindTimeoutSeconds = 600
-
 	stateKey framework.StateKey = Name
 
 	maxUtilization = 100
@@ -50,14 +47,13 @@ const (
 // framework.CycleState, in the later phases we don't need to call Write method
 // to update the value
 type stateData struct {
-	skip         bool // set true if pod does not have PVCs
-	boundClaims  []*v1.PersistentVolumeClaim
-	claimsToBind []*v1.PersistentVolumeClaim
-	allBound     bool
+	skip     bool // set true if pod does not have PVCs
+	allBound bool
 	// podVolumesByNode holds the pod's volume information found in the Filter
 	// phase for each node
 	// it's initialized in the PreFilter phase
 	podVolumesByNode map[string]*PodVolumes
+	podVolumeClaims  *PodVolumeClaims
 	sync.Mutex
 }
 
@@ -107,14 +103,10 @@ func (pl *VolumeBinding) EventsToRegister() []framework.ClusterEvent {
 		{Resource: framework.Node, ActionType: framework.Add | framework.UpdateNodeLabel},
 		// We rely on CSI node to translate in-tree PV to CSI.
 		{Resource: framework.CSINode, ActionType: framework.Add | framework.Update},
-	}
-	if pl.fts.EnableCSIStorageCapacity {
 		// When CSIStorageCapacity is enabled, pods may become schedulable
 		// on CSI driver & storage capacity changes.
-		events = append(events, []framework.ClusterEvent{
-			{Resource: framework.CSIDriver, ActionType: framework.Add | framework.Update},
-			{Resource: framework.CSIStorageCapacity, ActionType: framework.Add | framework.Update},
-		}...)
+		{Resource: framework.CSIDriver, ActionType: framework.Add | framework.Update},
+		{Resource: framework.CSIStorageCapacity, ActionType: framework.Add | framework.Update},
 	}
 	return events
 }
@@ -169,28 +161,43 @@ func (pl *VolumeBinding) podHasPVCs(pod *v1.Pod) (bool, error) {
 // PreFilter invoked at the prefilter extension point to check if pod has all
 // immediate PVCs bound. If not all immediate PVCs are bound, an
 // UnschedulableAndUnresolvable is returned.
-func (pl *VolumeBinding) PreFilter(ctx context.Context, state *framework.CycleState, pod *v1.Pod) *framework.Status {
+func (pl *VolumeBinding) PreFilter(ctx context.Context, state *framework.CycleState, pod *v1.Pod) (*framework.PreFilterResult, *framework.Status) {
 	// If pod does not reference any PVC, we don't need to do anything.
 	if hasPVC, err := pl.podHasPVCs(pod); err != nil {
-		return framework.NewStatus(framework.UnschedulableAndUnresolvable, err.Error())
+		return nil, framework.NewStatus(framework.UnschedulableAndUnresolvable, err.Error())
 	} else if !hasPVC {
 		state.Write(stateKey, &stateData{skip: true})
-		return nil
+		return nil, nil
 	}
-	boundClaims, claimsToBind, unboundClaimsImmediate, err := pl.Binder.GetPodVolumes(pod)
+	podVolumeClaims, err := pl.Binder.GetPodVolumeClaims(pod)
 	if err != nil {
-		return framework.AsStatus(err)
+		return nil, framework.AsStatus(err)
 	}
-	if len(unboundClaimsImmediate) > 0 {
+	if len(podVolumeClaims.unboundClaimsImmediate) > 0 {
 		// Return UnschedulableAndUnresolvable error if immediate claims are
 		// not bound. Pod will be moved to active/backoff queues once these
 		// claims are bound by PV controller.
 		status := framework.NewStatus(framework.UnschedulableAndUnresolvable)
 		status.AppendReason("pod has unbound immediate PersistentVolumeClaims")
-		return status
+		return nil, status
 	}
-	state.Write(stateKey, &stateData{boundClaims: boundClaims, claimsToBind: claimsToBind, podVolumesByNode: make(map[string]*PodVolumes)})
-	return nil
+	// Attempt to reduce down the number of nodes to consider in subsequent scheduling stages if pod has bound claims.
+	var result *framework.PreFilterResult
+	if eligibleNodes := pl.Binder.GetEligibleNodes(podVolumeClaims.boundClaims); eligibleNodes != nil {
+		result = &framework.PreFilterResult{
+			NodeNames: eligibleNodes,
+		}
+	}
+
+	state.Write(stateKey, &stateData{
+		podVolumesByNode: make(map[string]*PodVolumes),
+		podVolumeClaims: &PodVolumeClaims{
+			boundClaims:                podVolumeClaims.boundClaims,
+			unboundClaimsDelayBinding:  podVolumeClaims.unboundClaimsDelayBinding,
+			unboundVolumesDelayBinding: podVolumeClaims.unboundVolumesDelayBinding,
+		},
+	})
+	return result, nil
 }
 
 // PreFilterExtensions returns prefilter extensions, pod add and remove.
@@ -240,7 +247,7 @@ func (pl *VolumeBinding) Filter(ctx context.Context, cs *framework.CycleState, p
 		return nil
 	}
 
-	podVolumes, reasons, err := pl.Binder.FindPodVolumes(pod, state.boundClaims, state.claimsToBind, node)
+	podVolumes, reasons, err := pl.Binder.FindPodVolumes(pod, state.podVolumeClaims, node)
 
 	if err != nil {
 		return framework.AsStatus(err)
@@ -337,7 +344,7 @@ func (pl *VolumeBinding) PreBind(ctx context.Context, cs *framework.CycleState, 
 		return framework.AsStatus(fmt.Errorf("no pod volumes found for node %q", nodeName))
 	}
 	klog.V(5).InfoS("Trying to bind volumes for pod", "pod", klog.KObj(pod))
-	err = pl.Binder.BindPodVolumes(pod, podVolumes)
+	err = pl.Binder.BindPodVolumes(ctx, pod, podVolumes)
 	if err != nil {
 		klog.V(1).InfoS("Failed to bind volumes for pod", "pod", klog.KObj(pod), "err", err)
 		return framework.AsStatus(err)
@@ -359,7 +366,6 @@ func (pl *VolumeBinding) Unreserve(ctx context.Context, cs *framework.CycleState
 		return
 	}
 	pl.Binder.RevertAssumedPodVolumes(podVolumes)
-	return
 }
 
 // New initializes a new plugin and returns it.
@@ -379,12 +385,9 @@ func New(plArgs runtime.Object, fh framework.Handle, fts feature.Features) (fram
 	pvInformer := fh.SharedInformerFactory().Core().V1().PersistentVolumes()
 	storageClassInformer := fh.SharedInformerFactory().Storage().V1().StorageClasses()
 	csiNodeInformer := fh.SharedInformerFactory().Storage().V1().CSINodes()
-	var capacityCheck *CapacityCheck
-	if fts.EnableCSIStorageCapacity {
-		capacityCheck = &CapacityCheck{
-			CSIDriverInformer:          fh.SharedInformerFactory().Storage().V1().CSIDrivers(),
-			CSIStorageCapacityInformer: fh.SharedInformerFactory().Storage().V1beta1().CSIStorageCapacities(),
-		}
+	capacityCheck := CapacityCheck{
+		CSIDriverInformer:          fh.SharedInformerFactory().Storage().V1().CSIDrivers(),
+		CSIStorageCapacityInformer: fh.SharedInformerFactory().Storage().V1().CSIStorageCapacities(),
 	}
 	binder := NewVolumeBinder(fh.ClientSet(), podInformer, nodeInformer, csiNodeInformer, pvcInformer, pvInformer, storageClassInformer, capacityCheck, time.Duration(args.BindTimeoutSeconds)*time.Second)
 

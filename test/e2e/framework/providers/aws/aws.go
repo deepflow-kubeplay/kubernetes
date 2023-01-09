@@ -17,6 +17,7 @@ limitations under the License.
 package aws
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -26,7 +27,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/autoscaling"
 	"github.com/aws/aws-sdk-go/service/ec2"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2epv "k8s.io/kubernetes/test/e2e/framework/pv"
 	awscloud "k8s.io/legacy-cloud-providers/aws"
@@ -93,6 +94,14 @@ func (p *Provider) DeleteNode(node *v1.Node) error {
 	return err
 }
 
+func (p *Provider) CreateShare() (string, string, string, error) {
+	return "", "", "", nil
+}
+
+func (p *Provider) DeleteShare(accountName, shareName string) error {
+	return nil
+}
+
 // CreatePD creates a persistent volume on the specified availability zone
 func (p *Provider) CreatePD(zone string) (string, error) {
 	client := newAWSClient(zone)
@@ -155,7 +164,7 @@ func (p *Provider) DeletePD(pdName string) error {
 }
 
 // CreatePVSource creates a persistent volume source
-func (p *Provider) CreatePVSource(zone, diskName string) (*v1.PersistentVolumeSource, error) {
+func (p *Provider) CreatePVSource(ctx context.Context, zone, diskName string) (*v1.PersistentVolumeSource, error) {
 	return &v1.PersistentVolumeSource{
 		AWSElasticBlockStore: &v1.AWSElasticBlockStoreVolumeSource{
 			VolumeID: diskName,
@@ -165,8 +174,8 @@ func (p *Provider) CreatePVSource(zone, diskName string) (*v1.PersistentVolumeSo
 }
 
 // DeletePVSource deletes a persistent volume source
-func (p *Provider) DeletePVSource(pvSource *v1.PersistentVolumeSource) error {
-	return e2epv.DeletePDWithRetry(pvSource.AWSElasticBlockStore.VolumeID)
+func (p *Provider) DeletePVSource(ctx context.Context, pvSource *v1.PersistentVolumeSource) error {
+	return e2epv.DeletePDWithRetry(ctx, pvSource.AWSElasticBlockStore.VolumeID)
 }
 
 func newAWSClient(zone string) *ec2.EC2 {

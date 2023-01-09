@@ -18,7 +18,6 @@ package cmd
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
@@ -50,7 +49,7 @@ controlPlaneEndpoint: "3.4.5.6"
 
 func TestNewInitData(t *testing.T) {
 	// create temp directory
-	tmpDir, err := ioutil.TempDir("", "kubeadm-init-test")
+	tmpDir, err := os.MkdirTemp("", "kubeadm-init-test")
 	if err != nil {
 		t.Errorf("Unable to create temporary directory: %v", err)
 	}
@@ -175,13 +174,13 @@ func TestNewInitData(t *testing.T) {
 }
 
 func expectedInitIgnorePreflightErrors(expectedItems ...string) func(t *testing.T, data *initData) {
-	expected := sets.NewString(expectedItems...)
+	expected := sets.New(expectedItems...)
 	return func(t *testing.T, data *initData) {
 		if !expected.Equal(data.ignorePreflightErrors) {
-			t.Errorf("Invalid ignore preflight errors. Expected: %v. Actual: %v", expected.List(), data.ignorePreflightErrors.List())
+			t.Errorf("Invalid ignore preflight errors. Expected: %v. Actual: %v", sets.List(expected), sets.List(data.ignorePreflightErrors))
 		}
 		if !expected.HasAll(data.cfg.NodeRegistration.IgnorePreflightErrors...) {
-			t.Errorf("Invalid ignore preflight errors in InitConfiguration. Expected: %v. Actual: %v", expected.List(), data.cfg.NodeRegistration.IgnorePreflightErrors)
+			t.Errorf("Invalid ignore preflight errors in InitConfiguration. Expected: %v. Actual: %v", sets.List(expected), data.cfg.NodeRegistration.IgnorePreflightErrors)
 		}
 	}
 }

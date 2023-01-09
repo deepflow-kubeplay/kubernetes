@@ -86,7 +86,6 @@ type SetResourcesOptions struct {
 
 	UpdatePodSpecForObject polymorphichelpers.UpdatePodSpecForObjectFunc
 	Resources              []string
-	DryRunVerifier         *resource.DryRunVerifier
 
 	genericclioptions.IOStreams
 }
@@ -131,7 +130,7 @@ func NewCmdResources(f cmdutil.Factory, streams genericclioptions.IOStreams) *co
 	usage := "identifying the resource to get from a server."
 	cmdutil.AddFilenameOptionFlags(cmd, &o.FilenameOptions, usage)
 	cmd.Flags().BoolVar(&o.All, "all", o.All, "Select all resources, in the namespace of the specified resource types")
-	cmd.Flags().StringVarP(&o.Selector, "selector", "l", o.Selector, "Selector (label query) to filter on, supports '=', '==', and '!='.(e.g. -l key1=value1,key2=value2)")
+	cmdutil.AddLabelSelectorFlagVar(cmd, &o.Selector)
 	cmd.Flags().StringVarP(&o.ContainerSelector, "containers", "c", o.ContainerSelector, "The names of containers in the selected pod templates to change, all containers are selected by default - may use wildcards")
 	cmd.Flags().BoolVar(&o.Local, "local", o.Local, "If true, set resources will NOT contact api-server but run locally.")
 	cmdutil.AddDryRunFlag(cmd)
@@ -157,11 +156,6 @@ func (o *SetResourcesOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, ar
 	if err != nil {
 		return err
 	}
-	dynamicClient, err := f.DynamicClient()
-	if err != nil {
-		return err
-	}
-	o.DryRunVerifier = resource.NewDryRunVerifier(dynamicClient, f.OpenAPIGetter())
 
 	cmdutil.PrintFlagsWithDryRunStrategy(o.PrintFlags, o.DryRunStrategy)
 	printer, err := o.PrintFlags.ToPrinter()
@@ -199,10 +193,7 @@ func (o *SetResourcesOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, ar
 	}
 
 	o.Infos, err = builder.Do().Infos()
-	if err != nil {
-		return err
-	}
-	return nil
+	return err
 }
 
 // Validate makes sure that provided values in ResourcesOptions are valid
@@ -289,13 +280,6 @@ func (o *SetResourcesOptions) Run() error {
 				allErrs = append(allErrs, err)
 			}
 			continue
-		}
-
-		if o.DryRunStrategy == cmdutil.DryRunServer {
-			if err := o.DryRunVerifier.HasSupport(info.Mapping.GroupVersionKind); err != nil {
-				allErrs = append(allErrs, fmt.Errorf("failed to patch resources update to pod template %v", err))
-				continue
-			}
 		}
 
 		actual, err := resource.

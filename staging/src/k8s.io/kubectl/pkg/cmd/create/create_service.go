@@ -30,7 +30,6 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
-	"k8s.io/cli-runtime/pkg/resource"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
 	"k8s.io/kubectl/pkg/scheme"
@@ -74,9 +73,9 @@ type ServiceOptions struct {
 	Namespace        string
 	EnforceNamespace bool
 
-	Client         corev1client.CoreV1Interface
-	DryRunStrategy cmdutil.DryRunStrategy
-	DryRunVerifier *resource.DryRunVerifier
+	Client              corev1client.CoreV1Interface
+	DryRunStrategy      cmdutil.DryRunStrategy
+	ValidationDirective string
 	genericclioptions.IOStreams
 }
 
@@ -115,11 +114,6 @@ func (o *ServiceOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, args []
 	if err != nil {
 		return err
 	}
-	dynamicClient, err := f.DynamicClient()
-	if err != nil {
-		return err
-	}
-	o.DryRunVerifier = resource.NewDryRunVerifier(dynamicClient, f.OpenAPIGetter())
 	cmdutil.PrintFlagsWithDryRunStrategy(o.PrintFlags, o.DryRunStrategy)
 
 	printer, err := o.PrintFlags.ToPrinter()
@@ -129,6 +123,11 @@ func (o *ServiceOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, args []
 
 	o.PrintObj = func(obj runtime.Object) error {
 		return printer.PrintObj(obj, o.Out)
+	}
+
+	o.ValidationDirective, err = cmdutil.GetValidationDirective(cmd)
+	if err != nil {
+		return err
 	}
 
 	return nil
@@ -214,6 +213,7 @@ func (o *ServiceOptions) Run() error {
 		if o.FieldManager != "" {
 			createOptions.FieldManager = o.FieldManager
 		}
+		createOptions.FieldValidation = o.ValidationDirective
 		if o.DryRunStrategy == cmdutil.DryRunServer {
 			createOptions.DryRun = []string{metav1.DryRunAll}
 		}

@@ -73,10 +73,11 @@ type REST struct {
 func NewStorage(optsGetter generic.RESTOptionsGetter, k client.ConnectionInfoGetter, proxyTransport http.RoundTripper, podDisruptionBudgetClient policyclient.PodDisruptionBudgetsGetter) (PodStorage, error) {
 
 	store := &genericregistry.Store{
-		NewFunc:                  func() runtime.Object { return &api.Pod{} },
-		NewListFunc:              func() runtime.Object { return &api.PodList{} },
-		PredicateFunc:            registrypod.MatchPod,
-		DefaultQualifiedResource: api.Resource("pods"),
+		NewFunc:                   func() runtime.Object { return &api.Pod{} },
+		NewListFunc:               func() runtime.Object { return &api.PodList{} },
+		PredicateFunc:             registrypod.MatchPod,
+		DefaultQualifiedResource:  api.Resource("pods"),
+		SingularQualifiedResource: api.Resource("pod"),
 
 		CreateStrategy:      registrypod.Strategy,
 		UpdateStrategy:      registrypod.Strategy,
@@ -107,7 +108,7 @@ func NewStorage(optsGetter generic.RESTOptionsGetter, k client.ConnectionInfoGet
 		Pod:                 &REST{store, proxyTransport},
 		Binding:             &BindingREST{store: store},
 		LegacyBinding:       &LegacyBindingREST{bindingREST},
-		Eviction:            newEvictionStorage(store, podDisruptionBudgetClient),
+		Eviction:            newEvictionStorage(&statusStore, podDisruptionBudgetClient),
 		Status:              &StatusREST{store: &statusStore},
 		EphemeralContainers: &EphemeralContainersREST{store: &ephemeralContainersStore},
 		Log:                 &podrest.LogREST{Store: store, KubeletConn: k},
@@ -155,6 +156,12 @@ func (r *BindingREST) NamespaceScoped() bool {
 // New creates a new binding resource
 func (r *BindingREST) New() runtime.Object {
 	return &api.Binding{}
+}
+
+// Destroy cleans up resources on shutdown.
+func (r *BindingREST) Destroy() {
+	// Given that underlying store is shared with REST,
+	// we don't destroy it here explicitly.
 }
 
 var _ = rest.NamedCreater(&BindingREST{})
@@ -217,6 +224,10 @@ func (r *BindingREST) setPodHostAndAnnotations(ctx context.Context, podUID types
 		if pod.Spec.NodeName != "" {
 			return nil, fmt.Errorf("pod %v is already assigned to node %q", pod.Name, pod.Spec.NodeName)
 		}
+		// Reject binding to a scheduling un-ready Pod.
+		if utilfeature.DefaultFeatureGate.Enabled(features.PodSchedulingReadiness) && len(pod.Spec.SchedulingGates) != 0 {
+			return nil, fmt.Errorf("pod %v has non-empty .spec.schedulingGates", pod.Name)
+		}
 		pod.Spec.NodeName = machine
 		if pod.Annotations == nil {
 			pod.Annotations = make(map[string]string)
@@ -263,6 +274,12 @@ func (r *LegacyBindingREST) New() runtime.Object {
 	return r.bindingRest.New()
 }
 
+// Destroy cleans up resources on shutdown.
+func (r *LegacyBindingREST) Destroy() {
+	// Given that underlying store is shared with REST,
+	// we don't destroy it here explicitly.
+}
+
 // Create ensures a pod is bound to a specific host.
 func (r *LegacyBindingREST) Create(ctx context.Context, obj runtime.Object, createValidation rest.ValidateObjectFunc, options *metav1.CreateOptions) (out runtime.Object, err error) {
 	metadata, err := meta.Accessor(obj)
@@ -270,6 +287,10 @@ func (r *LegacyBindingREST) Create(ctx context.Context, obj runtime.Object, crea
 		return nil, errors.NewBadRequest(fmt.Sprintf("not a Binding object: %T", obj))
 	}
 	return r.bindingRest.Create(ctx, metadata.GetName(), obj, createValidation, options)
+}
+
+func (r *LegacyBindingREST) GetSingularName() string {
+	return "binding"
 }
 
 // StatusREST implements the REST endpoint for changing the status of a pod.
@@ -280,6 +301,12 @@ type StatusREST struct {
 // New creates a new pod resource
 func (r *StatusREST) New() runtime.Object {
 	return &api.Pod{}
+}
+
+// Destroy cleans up resources on shutdown.
+func (r *StatusREST) Destroy() {
+	// Given that underlying store is shared with REST,
+	// we don't destroy it here explicitly.
 }
 
 // Get retrieves the object from the storage. It is required to support Patch.
@@ -299,6 +326,10 @@ func (r *StatusREST) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
 	return r.store.GetResetFields()
 }
 
+func (r *StatusREST) ConvertToTable(ctx context.Context, object runtime.Object, tableOptions runtime.Object) (*metav1.Table, error) {
+	return r.store.ConvertToTable(ctx, object, tableOptions)
+}
+
 // EphemeralContainersREST implements the REST endpoint for adding EphemeralContainers
 type EphemeralContainersREST struct {
 	store *genericregistry.Store
@@ -308,10 +339,6 @@ var _ = rest.Patcher(&EphemeralContainersREST{})
 
 // Get retrieves the object from the storage. It is required to support Patch.
 func (r *EphemeralContainersREST) Get(ctx context.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
-	if !utilfeature.DefaultFeatureGate.Enabled(features.EphemeralContainers) {
-		return nil, errors.NewBadRequest("feature EphemeralContainers disabled")
-	}
-
 	return r.store.Get(ctx, name, options)
 }
 
@@ -320,12 +347,14 @@ func (r *EphemeralContainersREST) New() runtime.Object {
 	return &api.Pod{}
 }
 
+// Destroy cleans up resources on shutdown.
+func (r *EphemeralContainersREST) Destroy() {
+	// Given that underlying store is shared with REST,
+	// we don't destroy it here explicitly.
+}
+
 // Update alters the EphemeralContainers field in PodSpec
 func (r *EphemeralContainersREST) Update(ctx context.Context, name string, objInfo rest.UpdatedObjectInfo, createValidation rest.ValidateObjectFunc, updateValidation rest.ValidateObjectUpdateFunc, forceAllowCreate bool, options *metav1.UpdateOptions) (runtime.Object, bool, error) {
-	if !utilfeature.DefaultFeatureGate.Enabled(features.EphemeralContainers) {
-		return nil, false, errors.NewBadRequest("feature EphemeralContainers disabled")
-	}
-
 	// We are explicitly setting forceAllowCreate to false in the call to the underlying storage because
 	// subresources should never allow create on update.
 	return r.store.Update(ctx, name, objInfo, createValidation, updateValidation, false, options)

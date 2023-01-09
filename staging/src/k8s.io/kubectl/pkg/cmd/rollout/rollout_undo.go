@@ -27,7 +27,7 @@ import (
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
 	"k8s.io/kubectl/pkg/polymorphichelpers"
 	"k8s.io/kubectl/pkg/scheme"
-	"k8s.io/kubectl/pkg/util"
+	"k8s.io/kubectl/pkg/util/completion"
 	"k8s.io/kubectl/pkg/util/i18n"
 	"k8s.io/kubectl/pkg/util/templates"
 )
@@ -41,9 +41,9 @@ type UndoOptions struct {
 	Builder          func() *resource.Builder
 	ToRevision       int64
 	DryRunStrategy   cmdutil.DryRunStrategy
-	DryRunVerifier   *resource.DryRunVerifier
 	Resources        []string
 	Namespace        string
+	LabelSelector    string
 	EnforceNamespace bool
 	RESTClientGetter genericclioptions.RESTClientGetter
 
@@ -87,7 +87,7 @@ func NewCmdRolloutUndo(f cmdutil.Factory, streams genericclioptions.IOStreams) *
 		Short:                 i18n.T("Undo a previous rollout"),
 		Long:                  undoLong,
 		Example:               undoExample,
-		ValidArgsFunction:     util.SpecifiedResourceTypeAndNameCompletionFunc(f, validArgs),
+		ValidArgsFunction:     completion.SpecifiedResourceTypeAndNameCompletionFunc(f, validArgs),
 		Run: func(cmd *cobra.Command, args []string) {
 			cmdutil.CheckErr(o.Complete(f, cmd, args))
 			cmdutil.CheckErr(o.Validate())
@@ -99,6 +99,7 @@ func NewCmdRolloutUndo(f cmdutil.Factory, streams genericclioptions.IOStreams) *
 	usage := "identifying the resource to get from a server."
 	cmdutil.AddFilenameOptionFlags(cmd, &o.FilenameOptions, usage)
 	cmdutil.AddDryRunFlag(cmd)
+	cmdutil.AddLabelSelectorFlagVar(cmd, &o.LabelSelector)
 	o.PrintFlags.AddFlags(cmd)
 	return cmd
 }
@@ -111,11 +112,6 @@ func (o *UndoOptions) Complete(f cmdutil.Factory, cmd *cobra.Command, args []str
 	if err != nil {
 		return err
 	}
-	dynamicClient, err := f.DynamicClient()
-	if err != nil {
-		return err
-	}
-	o.DryRunVerifier = resource.NewDryRunVerifier(dynamicClient, f.OpenAPIGetter())
 
 	if o.Namespace, o.EnforceNamespace, err = f.ToRawKubeConfigLoader().Namespace(); err != nil {
 		return err
@@ -145,6 +141,7 @@ func (o *UndoOptions) RunUndo() error {
 	r := o.Builder().
 		WithScheme(scheme.Scheme, scheme.Scheme.PrioritizedVersionsAllGroups()...).
 		NamespaceParam(o.Namespace).DefaultNamespace().
+		LabelSelectorParam(o.LabelSelector).
 		FilenameParam(o.EnforceNamespace, &o.FilenameOptions).
 		ResourceTypeOrNameArgs(true, o.Resources...).
 		ContinueOnError().
@@ -164,11 +161,6 @@ func (o *UndoOptions) RunUndo() error {
 			return err
 		}
 
-		if o.DryRunStrategy == cmdutil.DryRunServer {
-			if err := o.DryRunVerifier.HasSupport(info.Mapping.GroupVersionKind); err != nil {
-				return err
-			}
-		}
 		result, err := rollbacker.Rollback(info.Object, nil, o.ToRevision, o.DryRunStrategy)
 		if err != nil {
 			return err

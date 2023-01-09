@@ -27,7 +27,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
-	"k8s.io/cli-runtime/pkg/resource"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
 	"k8s.io/kubectl/pkg/scheme"
@@ -108,9 +107,9 @@ type CreateSecretDockerRegistryOptions struct {
 	Namespace        string
 	EnforceNamespace bool
 
-	Client         corev1client.CoreV1Interface
-	DryRunStrategy cmdutil.DryRunStrategy
-	DryRunVerifier *resource.DryRunVerifier
+	Client              corev1client.CoreV1Interface
+	DryRunStrategy      cmdutil.DryRunStrategy
+	ValidationDirective string
 
 	genericclioptions.IOStreams
 }
@@ -184,18 +183,6 @@ func (o *CreateSecretDockerRegistryOptions) Complete(f cmdutil.Factory, cmd *cob
 		return err
 	}
 
-	dynamicClient, err := f.DynamicClient()
-	if err != nil {
-		return err
-	}
-
-	discoveryClient, err := f.ToDiscoveryClient()
-	if err != nil {
-		return err
-	}
-
-	o.DryRunVerifier = resource.NewDryRunVerifier(dynamicClient, discoveryClient)
-
 	o.Namespace, o.EnforceNamespace, err = f.ToRawKubeConfigLoader().Namespace()
 	if err != nil {
 		return err
@@ -209,6 +196,11 @@ func (o *CreateSecretDockerRegistryOptions) Complete(f cmdutil.Factory, cmd *cob
 
 	o.PrintObj = func(obj runtime.Object) error {
 		return printer.PrintObj(obj, o.Out)
+	}
+
+	o.ValidationDirective, err = cmdutil.GetValidationDirective(cmd)
+	if err != nil {
+		return err
 	}
 
 	return nil
@@ -241,11 +233,8 @@ func (o *CreateSecretDockerRegistryOptions) Run() error {
 		if o.FieldManager != "" {
 			createOptions.FieldManager = o.FieldManager
 		}
+		createOptions.FieldValidation = o.ValidationDirective
 		if o.DryRunStrategy == cmdutil.DryRunServer {
-			err := o.DryRunVerifier.HasSupport(secretDockerRegistry.GroupVersionKind())
-			if err != nil {
-				return err
-			}
 			createOptions.DryRun = []string{metav1.DryRunAll}
 		}
 		secretDockerRegistry, err = o.Client.Secrets(o.Namespace).Create(context.TODO(), secretDockerRegistry, createOptions)

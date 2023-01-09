@@ -23,7 +23,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"os"
 	"sort"
@@ -50,13 +50,13 @@ import (
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	"k8s.io/kubernetes/test/e2e_node/perftype"
 
-	"github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
 )
 
 const (
 	// resource monitoring
-	cadvisorImageName = "google/cadvisor:latest"
+	cadvisorImageName = "gcr.io/cadvisor/cadvisor:v0.43.0"
 	cadvisorPodName   = "cadvisor"
 	cadvisorPort      = 8090
 	// housekeeping interval of Cadvisor (second)
@@ -95,7 +95,7 @@ func (r *ResourceCollector) Start() {
 	// Get the cgroup container names for kubelet and runtime
 	kubeletContainer, err1 := getContainerNameForProcess(kubeletProcessName, "")
 	runtimeContainer, err2 := getContainerNameForProcess(framework.TestContext.ContainerRuntimeProcessName, framework.TestContext.ContainerRuntimePidFile)
-	if err1 == nil && err2 == nil {
+	if err1 == nil && err2 == nil && kubeletContainer != "" && runtimeContainer != "" {
 		systemContainers = map[string]string{
 			kubeletstatsv1alpha1.SystemContainerKubelet: kubeletContainer,
 			kubeletstatsv1alpha1.SystemContainerRuntime: runtimeContainer,
@@ -370,7 +370,7 @@ func getCadvisorPod() *v1.Pod {
 }
 
 // deletePodsSync deletes a list of pods and block until pods disappear.
-func deletePodsSync(f *framework.Framework, pods []*v1.Pod) {
+func deletePodsSync(ctx context.Context, f *framework.Framework, pods []*v1.Pod) {
 	var wg sync.WaitGroup
 	for i := range pods {
 		pod := pods[i]
@@ -379,12 +379,12 @@ func deletePodsSync(f *framework.Framework, pods []*v1.Pod) {
 			defer ginkgo.GinkgoRecover()
 			defer wg.Done()
 
-			err := f.PodClient().Delete(context.TODO(), pod.ObjectMeta.Name, *metav1.NewDeleteOptions(30))
+			err := e2epod.NewPodClient(f).Delete(ctx, pod.ObjectMeta.Name, *metav1.NewDeleteOptions(30))
 			if apierrors.IsNotFound(err) {
 				framework.Failf("Unexpected error trying to delete pod %s: %v", pod.Name, err)
 			}
 
-			gomega.Expect(e2epod.WaitForPodToDisappear(f.ClientSet, f.Namespace.Name, pod.ObjectMeta.Name, labels.Everything(),
+			gomega.Expect(e2epod.WaitForPodToDisappear(ctx, f.ClientSet, f.Namespace.Name, pod.ObjectMeta.Name, labels.Everything(),
 				30*time.Second, 10*time.Minute)).NotTo(gomega.HaveOccurred())
 		}()
 	}
@@ -486,7 +486,7 @@ func getPidFromPidFile(pidFile string) (int, error) {
 	}
 	defer file.Close()
 
-	data, err := ioutil.ReadAll(file)
+	data, err := io.ReadAll(file)
 	if err != nil {
 		return 0, fmt.Errorf("error reading pid file %s: %v", pidFile, err)
 	}

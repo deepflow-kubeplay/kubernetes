@@ -22,14 +22,14 @@ import (
 	"testing"
 
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
-	kubeadmapiv1beta2 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta2"
+	kubeadmapiv1beta3 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta3"
 	"k8s.io/kubernetes/cmd/kubeadm/app/constants"
 )
 
 const (
 	testversion = "v10.1.2-alpha.1.100+0123456789abcdef+SOMETHING"
 	expected    = "v10.1.2-alpha.1.100_0123456789abcdef_SOMETHING"
-	gcrPrefix   = "k8s.gcr.io"
+	gcrPrefix   = "registry.k8s.io"
 )
 
 func TestGetGenericImage(t *testing.T) {
@@ -70,6 +70,14 @@ func TestGetKubernetesImage(t *testing.T) {
 		{
 			image:    constants.KubeScheduler,
 			expected: GetGenericImage(gcrPrefix, "kube-scheduler", expected),
+			cfg: &kubeadmapi.ClusterConfiguration{
+				ImageRepository:   gcrPrefix,
+				KubernetesVersion: testversion,
+			},
+		},
+		{
+			image:    constants.KubeProxy,
+			expected: GetGenericImage(gcrPrefix, "kube-proxy", expected),
 			cfg: &kubeadmapi.ClusterConfiguration{
 				ImageRepository:   gcrPrefix,
 				KubernetesVersion: testversion,
@@ -233,31 +241,37 @@ func TestGetDNSImage(t *testing.T) {
 		cfg      *kubeadmapi.ClusterConfiguration
 	}{
 		{
-			expected: "foo.io/coredns:v1.8.6",
+			expected: "foo.io/coredns:v1.10.0",
 			cfg: &kubeadmapi.ClusterConfiguration{
 				ImageRepository: "foo.io",
-				DNS: kubeadmapi.DNS{
-					Type: kubeadmapi.CoreDNS,
-				},
+				DNS:             kubeadmapi.DNS{},
 			},
 		},
 		{
-			expected: kubeadmapiv1beta2.DefaultImageRepository + "/coredns/coredns:v1.8.6",
+			expected: kubeadmapiv1beta3.DefaultImageRepository + "/coredns/coredns:v1.10.0",
 			cfg: &kubeadmapi.ClusterConfiguration{
-				ImageRepository: kubeadmapiv1beta2.DefaultImageRepository,
-				DNS: kubeadmapi.DNS{
-					Type: kubeadmapi.CoreDNS,
-				},
+				ImageRepository: kubeadmapiv1beta3.DefaultImageRepository,
+				DNS:             kubeadmapi.DNS{},
 			},
 		},
 		{
-			expected: "foo.io/coredns/coredns:v1.8.6",
+			expected: "foo.io/coredns/coredns:v1.10.0",
 			cfg: &kubeadmapi.ClusterConfiguration{
 				ImageRepository: "foo.io",
 				DNS: kubeadmapi.DNS{
-					Type: kubeadmapi.CoreDNS,
 					ImageMeta: kubeadmapi.ImageMeta{
 						ImageRepository: "foo.io/coredns",
+					},
+				},
+			},
+		},
+		{
+			expected: "foo.io/coredns/coredns:v1.11.0",
+			cfg: &kubeadmapi.ClusterConfiguration{
+				ImageRepository: "foo.io/coredns",
+				DNS: kubeadmapi.DNS{
+					ImageMeta: kubeadmapi.ImageMeta{
+						ImageTag: "v1.11.0",
 					},
 				},
 			},

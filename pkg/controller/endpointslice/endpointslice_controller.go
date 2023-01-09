@@ -39,7 +39,6 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
-	"k8s.io/component-base/metrics/prometheus/ratelimiter"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/controller"
 	endpointslicemetrics "k8s.io/kubernetes/pkg/controller/endpointslice/metrics"
@@ -69,7 +68,7 @@ const (
 	// defaultSyncBackOff is the default backoff period for syncService calls.
 	defaultSyncBackOff = 1 * time.Second
 	// maxSyncBackOff is the max backoff period for syncService calls.
-	maxSyncBackOff = 100 * time.Second
+	maxSyncBackOff = 1000 * time.Second
 
 	// controllerName is a unique value used with LabelManagedBy to indicated
 	// the component managing an EndpointSlice.
@@ -86,13 +85,7 @@ func NewController(podInformer coreinformers.PodInformer,
 	endpointUpdatesBatchPeriod time.Duration,
 ) *Controller {
 	broadcaster := record.NewBroadcaster()
-	broadcaster.StartStructuredLogging(0)
-	broadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: client.CoreV1().Events("")})
 	recorder := broadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "endpoint-slice-controller"})
-
-	if client != nil && client.CoreV1().RESTClient().GetRateLimiter() != nil {
-		ratelimiter.RegisterMetricAndTrackRateLimiterUsage("endpoint_slice_controller", client.DiscoveryV1().RESTClient().GetRateLimiter())
-	}
 
 	endpointslicemetrics.RegisterMetrics()
 
@@ -152,7 +145,6 @@ func NewController(podInformer coreinformers.PodInformer,
 	c.eventRecorder = recorder
 
 	c.endpointUpdatesBatchPeriod = endpointUpdatesBatchPeriod
-	c.serviceSelectorCache = endpointutil.NewServiceSelectorCache()
 
 	if utilfeature.DefaultFeatureGate.Enabled(features.TopologyAwareHints) {
 		nodeInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -171,6 +163,7 @@ func NewController(podInformer coreinformers.PodInformer,
 		endpointSliceTracker: c.endpointSliceTracker,
 		metricsCache:         endpointslicemetrics.NewCache(maxEndpointsPerSlice),
 		topologyCache:        c.topologyCache,
+		eventRecorder:        c.eventRecorder,
 	}
 
 	return c
@@ -240,10 +233,6 @@ type Controller struct {
 	// This can be used to reduce overall number of all endpoint slice updates.
 	endpointUpdatesBatchPeriod time.Duration
 
-	// serviceSelectorCache is a cache of service selectors to avoid high CPU consumption caused by frequent calls
-	// to AsSelectorPreValidated (see #73527)
-	serviceSelectorCache *endpointutil.ServiceSelectorCache
-
 	// topologyCache tracks the distribution of Nodes and endpoints across zones
 	// to enable TopologyAwareHints.
 	topologyCache *topologycache.TopologyCache
@@ -252,6 +241,12 @@ type Controller struct {
 // Run will not return until stopCh is closed.
 func (c *Controller) Run(workers int, stopCh <-chan struct{}) {
 	defer utilruntime.HandleCrash()
+
+	// Start events processing pipeline.
+	c.eventBroadcaster.StartLogging(klog.Infof)
+	c.eventBroadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: c.client.CoreV1().Events("")})
+	defer c.eventBroadcaster.Shutdown()
+
 	defer c.queue.ShutDown()
 
 	klog.Infof("Starting endpoint slice controller")
@@ -264,10 +259,6 @@ func (c *Controller) Run(workers int, stopCh <-chan struct{}) {
 	for i := 0; i < workers; i++ {
 		go wait.Until(c.worker, c.workerLoopPeriod, stopCh)
 	}
-
-	go func() {
-		defer utilruntime.HandleCrash()
-	}()
 
 	<-stopCh
 }
@@ -326,14 +317,15 @@ func (c *Controller) syncService(key string) error {
 
 	service, err := c.serviceLister.Services(namespace).Get(name)
 	if err != nil {
-		if apierrors.IsNotFound(err) {
-			c.triggerTimeTracker.DeleteService(namespace, name)
-			c.reconciler.deleteService(namespace, name)
-			c.endpointSliceTracker.DeleteService(namespace, name)
-			// The service has been deleted, return nil so that it won't be retried.
-			return nil
+		if !apierrors.IsNotFound(err) {
+			return err
 		}
-		return err
+
+		c.triggerTimeTracker.DeleteService(namespace, name)
+		c.reconciler.deleteService(namespace, name)
+		c.endpointSliceTracker.DeleteService(namespace, name)
+		// The service has been deleted, return nil so that it won't be retried.
+		return nil
 	}
 
 	if service.Spec.Selector == nil {
@@ -368,6 +360,9 @@ func (c *Controller) syncService(key string) error {
 		return err
 	}
 
+	// Drop EndpointSlices that have been marked for deletion to prevent the controller from getting stuck.
+	endpointSlices = dropEndpointSlicesPendingDeletion(endpointSlices)
+
 	if c.endpointSliceTracker.StaleSlices(service, endpointSlices) {
 		return endpointsliceutil.NewStaleInformerCache("EndpointSlice informer cache is out of date")
 	}
@@ -396,7 +391,6 @@ func (c *Controller) onServiceUpdate(obj interface{}) {
 		return
 	}
 
-	_ = c.serviceSelectorCache.Update(key, obj.(*v1.Service).Spec.Selector)
 	c.queue.Add(key)
 }
 
@@ -408,7 +402,6 @@ func (c *Controller) onServiceDelete(obj interface{}) {
 		return
 	}
 
-	c.serviceSelectorCache.Delete(key)
 	c.queue.Add(key)
 }
 
@@ -487,7 +480,7 @@ func (c *Controller) queueServiceForEndpointSlice(endpointSlice *discovery.Endpo
 
 func (c *Controller) addPod(obj interface{}) {
 	pod := obj.(*v1.Pod)
-	services, err := c.serviceSelectorCache.GetPodServiceMemberships(c.serviceLister, pod)
+	services, err := endpointutil.GetPodServiceMemberships(c.serviceLister, pod)
 	if err != nil {
 		utilruntime.HandleError(fmt.Errorf("Unable to get pod %s/%s's service memberships: %v", pod.Namespace, pod.Name, err))
 		return
@@ -498,7 +491,7 @@ func (c *Controller) addPod(obj interface{}) {
 }
 
 func (c *Controller) updatePod(old, cur interface{}) {
-	services := endpointutil.GetServicesToUpdateOnPodChange(c.serviceLister, c.serviceSelectorCache, old, cur)
+	services := endpointutil.GetServicesToUpdateOnPodChange(c.serviceLister, old, cur)
 	for key := range services {
 		c.queue.AddAfter(key, c.endpointUpdatesBatchPeriod)
 	}
@@ -539,6 +532,7 @@ func (c *Controller) checkNodeTopologyDistribution() {
 	nodes, err := c.nodeLister.List(labels.Everything())
 	if err != nil {
 		klog.Errorf("Error listing Nodes: %v", err)
+		return
 	}
 	c.topologyCache.SetNodes(nodes)
 	serviceKeys := c.topologyCache.GetOverloadedServices()
@@ -559,4 +553,15 @@ func trackSync(err error) {
 		}
 	}
 	endpointslicemetrics.EndpointSliceSyncs.WithLabelValues(metricLabel).Inc()
+}
+
+func dropEndpointSlicesPendingDeletion(endpointSlices []*discovery.EndpointSlice) []*discovery.EndpointSlice {
+	n := 0
+	for _, endpointSlice := range endpointSlices {
+		if endpointSlice.DeletionTimestamp == nil {
+			endpointSlices[n] = endpointSlice
+			n++
+		}
+	}
+	return endpointSlices[:n]
 }

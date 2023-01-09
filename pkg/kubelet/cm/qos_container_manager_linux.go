@@ -23,14 +23,13 @@ import (
 	"sync"
 	"time"
 
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
 
 	"k8s.io/apimachinery/pkg/util/wait"
 
 	units "github.com/docker/go-units"
 	libcontainercgroups "github.com/opencontainers/runc/libcontainer/cgroups"
-	cgroupfs "github.com/opencontainers/runc/libcontainer/cgroups/fs"
-	v1 "k8s.io/api/core/v1"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/kubernetes/pkg/api/v1/resource"
 	v1qos "k8s.io/kubernetes/pkg/apis/core/v1/helper/qos"
@@ -99,7 +98,7 @@ func (m *qosContainerManagerImpl) Start(getNodeAllocatable func() v1.ResourceLis
 		// the BestEffort QoS class has a statically configured minShares value
 		if qosClass == v1.PodQOSBestEffort {
 			minShares := uint64(MinShares)
-			resourceParameters.CpuShares = &minShares
+			resourceParameters.CPUShares = &minShares
 		}
 
 		// containerConfig object stores the cgroup specifications
@@ -147,7 +146,7 @@ func (m *qosContainerManagerImpl) Start(getNodeAllocatable func() v1.ResourceLis
 // setHugePagesUnbounded ensures hugetlb is effectively unbounded
 func (m *qosContainerManagerImpl) setHugePagesUnbounded(cgroupConfig *CgroupConfig) error {
 	hugePageLimit := map[int64]int64{}
-	for _, pageSize := range cgroupfs.HugePageSizes {
+	for _, pageSize := range libcontainercgroups.HugePageSizes() {
 		pageSizeBytes, err := units.RAMInBytes(pageSize)
 		if err != nil {
 			return err
@@ -185,11 +184,11 @@ func (m *qosContainerManagerImpl) setCPUCgroupConfig(configs map[v1.PodQOSClass]
 
 	// make sure best effort is always 2 shares
 	bestEffortCPUShares := uint64(MinShares)
-	configs[v1.PodQOSBestEffort].ResourceParameters.CpuShares = &bestEffortCPUShares
+	configs[v1.PodQOSBestEffort].ResourceParameters.CPUShares = &bestEffortCPUShares
 
 	// set burstable shares based on current observe state
 	burstableCPUShares := MilliCPUToShares(burstablePodCPURequest)
-	configs[v1.PodQOSBurstable].ResourceParameters.CpuShares = &burstableCPUShares
+	configs[v1.PodQOSBurstable].ResourceParameters.CPUShares = &burstableCPUShares
 	return nil
 }
 
